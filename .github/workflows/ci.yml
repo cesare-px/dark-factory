@@ -1,0 +1,39 @@
+# Enforces the style/lint/type-check/test standards for this repo on every
+# push and PR. Runs on the orchestrator's own source, not on any downstream
+# project repo -- see .github/workflows/orchestrate.yml for that.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dark-factory with dev tools
+        run: make install
+
+      - name: Ruff lint
+        run: make lint
+
+      - name: Ruff format check
+        run: make format-check
+
+      - name: Mypy
+        run: make typecheck
+
+      - name: Pytest
+        run: make test

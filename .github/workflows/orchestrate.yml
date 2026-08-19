@@ -1,0 +1,147 @@
+# The central orchestrator's reusable workflow. Downstream project repos
+# never call anything here directly -- their thin caller.yml (templates/
+# project-repo-template/.github/workflows/caller.yml) invokes this via
+# `uses:`, per the blueprint's twin-repo split (all agent logic lives here,
+# never in a project repo).
+#
+# All GitHub Actions logic is intentionally thin: it authenticates, checks
+# out both repos, installs this package, and calls the `dark-factory` CLI.
+# Everything provider-specific, config-specific, and pipeline-specific lives
+# in Python (src/dark_factory/) so it is unit-testable and versioned
+# independently of workflow YAML syntax.
+
+name: Dark Factory Orchestrator
+
+on:
+  workflow_call:
+    inputs:
+      event_name:
+        description: "The triggering GitHub event name (issues, pull_request, workflow_dispatch)"
+        type: string
+        required: true
+      repository:
+        description: "owner/repo of the downstream project repo"
+        type: string
+        required: true
+      issue_number:
+        description: "The issue (or PR) number this run concerns"
+        type: number
+        required: true
+      config_path:
+        description: "Path to the downstream repo's config file, if not the default .dark-factory.yml"
+        type: string
+        default: ""
+      core_ref:
+        description: "Git ref of this orchestrator repo to run (defaults to whatever triggered this workflow)"
+        type: string
+        default: ""
+      python_version:
+        type: string
+        default: "3.12"
+      dry_run:
+        description: "Force the mock provider; useful for smoke-testing a new downstream repo with zero spend"
+        type: boolean
+        default: false
+    secrets:
+      app_id:
+        description: "GitHub App ID, scoped to the downstream repo only"
+        required: true
+      app_private_key:
+        required: true
+      llm_api_key:
+        description: "Forwarded to whatever env var the downstream repo's config names via llm.api_key_env"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dark-factory-${{ inputs.repository }}-${{ inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Mint a short-lived installation token for the downstream repo
+        id: app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.app_id }}
+          private-key: ${{ secrets.app_private_key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ inputs.repository }}
+
+      - name: Checkout downstream project repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          token: ${{ steps.app_token.outputs.token }}
+          path: project
+
+      - name: Checkout this orchestrator
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.core_ref || github.sha }}
+          path: factory-core
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+
+      - name: Install dark-factory
+        run: python -m pip install ./factory-core
+
+      - name: Check configuration
+        working-directory: project
+        env:
+          LLM_API_KEY: ${{ secrets.llm_api_key }}
+        run: dark-factory doctor ${{ inputs.config_path && format('--config {0}', inputs.config_path) || '' }}
+
+      - name: Run the pipeline
+        id: run
+        working-directory: project
+        env:
+          LLM_API_KEY: ${{ secrets.llm_api_key }}
+          GITHUB_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          set +e
+          dark-factory run \
+            --event-path "$GITHUB_EVENT_PATH" \
+            --event-name "${{ inputs.event_name }}" \
+            ${{ inputs.config_path && format('--config {0}', inputs.config_path) || '' }} \
+            ${{ inputs.dry_run && '--dry-run' || '' }} \
+            --output run-report.json \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          # PIPESTATUS[0], not $?, because $? after a pipe reflects `tee`'s
+          # exit code, not dark-factory's.
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Apply labels and comment from the run report
+        if: always() && hashFiles('project/run-report.json') != ''
+        working-directory: project
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          labels=$(python3 -c "import json;print(','.join(json.load(open('run-report.json'))['labels']))")
+          comments=$(python3 -c "import json;print('\n\n---\n\n'.join(json.load(open('run-report.json'))['comments']))")
+          if [ -n "$labels" ]; then
+            gh issue edit "${{ inputs.issue_number }}" --repo "${{ inputs.repository }}" --add-label "$labels" || true
+          fi
+          if [ -n "$comments" ]; then
+            gh issue comment "${{ inputs.issue_number }}" --repo "${{ inputs.repository }}" --body "$comments" || true
+          fi
+
+      - name: Upload run report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dark-factory-run-report
+          path: project/run-report.json
+          if-no-files-found: ignore
+
+      - name: Fail the job if the pipeline did not pass
+        run: exit ${{ steps.run.outputs.exit_code }}

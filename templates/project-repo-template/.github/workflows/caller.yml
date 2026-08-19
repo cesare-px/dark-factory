@@ -1,0 +1,71 @@
+# Generic caller workflow for the Dark Software Factory (blueprint §2.B).
+#
+# This file lives in every downstream project repo (Repo B, C, D...) cloned
+# from the template. It contains ZERO agent intelligence -- it only points
+# GitHub events at the central orchestrator's reusable workflow, which mints
+# its own short-lived GitHub App token internally (never handled here).
+#
+# THE WHOLE ADOPTION SURFACE for a new project repo is this file plus
+# .dark-factory.yml at the repo root (see that file's comments -- it is
+# fully optional; delete it for sane defaults). Everything else -- which
+# model runs, what the budget ceiling is, how branches are named -- is
+# config, not code.
+#
+# Required repo secrets:
+#   DARK_FACTORY_APP_ID          - the GitHub App's numeric ID
+#   DARK_FACTORY_APP_PRIVATE_KEY - the GitHub App's private key (PEM)
+#   LLM_API_KEY                  - forwarded to whatever env var
+#                                   `llm.api_key_env` in .dark-factory.yml
+#                                   names (default: LLM_API_KEY itself).
+#                                   Not needed for a local/free provider
+#                                   (e.g. openai_compatible + ollama).
+#
+# Pin `uses:` below to a released tag/SHA of dark-factory (not `@main`)
+# so a change to the orchestrator can't silently alter behavior across every
+# downstream project at once.
+
+name: Dark Factory
+
+on:
+  issues:
+    types: [opened, edited, labeled]
+  pull_request:
+    # Only ever fires for PRs the factory itself opened
+    # (dark-factory/issue-*), never an arbitrary external PR -- see the `if:`
+    # guard below. This keeps untrusted forks from reaching a workflow that
+    # has repo secrets in scope.
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to (re-)run the factory against"
+        required: true
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  id-token: write
+
+concurrency:
+  # Sequential per-repo execution (blueprint §4.B "Sequential Task
+  # Execution") to avoid chaotic concurrent merge conflicts across
+  # autonomous branches for the same project.
+  group: dark-factory-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  orchestrate:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'issues' ||
+      startsWith(github.event.pull_request.head.ref, 'dark-factory/')
+    uses: your-org/dark-factory/.github/workflows/orchestrate.yml@v1
+    with:
+      event_name: ${{ github.event_name }}
+      repository: ${{ github.repository }}
+      issue_number: ${{ github.event.issue.number || github.event.pull_request.number || inputs.issue_number }}
+    secrets:
+      app_id: ${{ secrets.DARK_FACTORY_APP_ID }}
+      app_private_key: ${{ secrets.DARK_FACTORY_APP_PRIVATE_KEY }}
+      llm_api_key: ${{ secrets.LLM_API_KEY }}

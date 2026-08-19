@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------------------
+# Dark Factory configuration. Everything here is OPTIONAL: delete the whole
+# file and you get sane defaults (mock provider, $3 ceiling, 5 build-test-fix
+# retries). Run `dark-factory doctor` from this repo's root to check your
+# setup before the factory ever spends real money.
+#
+# NEVER put an API key in this file -- it is committed to git and will be
+# copy-pasted across repos. Only name the environment variable / GitHub
+# secret that holds it (api_key_env), which caller.yml populates from the
+# LLM_API_KEY repo secret.
+# ---------------------------------------------------------------------------
+
+llm:
+  provider: anthropic # anthropic | openai | openai_compatible | mock
+  model: claude-sonnet-5
+  api_key_env: LLM_API_KEY
+
+# Named model presets, so per-agent overrides below stay one line each.
+models:
+  cheap:
+    provider: anthropic
+    model: claude-haiku-4-5
+    api_key_env: LLM_API_KEY
+
+# Per-agent overrides: a cheap model for gatekeeping, the default (stronger)
+# model for planning and writing code.
+agents:
+  validator:
+    use: cheap
+  planner:
+    use: cheap
+  developer:
+    max_iterations: 4 # overrides `loop.max_iterations` for this agent only
+
+# Hard USD ceiling for one ticket's ENTIRE pipeline run (all four agents
+# combined). Once exceeded, the run halts and the ticket is labeled
+# `factory-blocked` for a human to look at -- it never spends past this.
+budget:
+  max_usd: 3.00
+
+# Build-test-fix retry cap (blueprint §4.B). Once exceeded, same as above:
+# halt and flag for a human rather than looping forever.
+loop:
+  max_iterations: 5
+
+# The one command that decides whether the factory's work is acceptable.
+test_harness:
+  command: ./factory-test.sh
+
+# ---------------------------------------------------------------------------
+# Fully local, zero-cost alternative -- comment out everything above and use
+# this instead to run entirely against a local Ollama server with no API
+# key and no per-token cost:
+#
+# llm:
+#   provider: openai_compatible
+#   preset: ollama
+#   model: qwen2.5-coder:32b
+#
+# Any OpenAI-compatible endpoint works the same way -- swap `preset` for
+# `moonshot` (Kimi), `zhipu` (GLM), `dashscope` (Qwen), or set `base_url`
+# directly for anything else (vLLM, OpenRouter, Together, Groq, ...).
+# ---------------------------------------------------------------------------
