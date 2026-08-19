@@ -82,6 +82,30 @@ jobs:
       llm_api_key: ${{ secrets.LLM_API_KEY }}
 """
 
+ISSUE_TEMPLATE = """\
+---
+name: Dark Factory Task
+about: Request autonomous implementation from the Dark Software Factory
+title: ""
+labels: []
+---
+
+## User Story
+
+<!-- As a <role>, I want <capability>, so that <benefit>. -->
+
+## Expected Behavior
+
+<!-- What should the system do once this is implemented? -->
+
+## Acceptance Criteria
+
+<!-- Bulleted list. Each item must be independently verifiable by the test harness. -->
+
+-
+-
+"""
+
 _AGENT_NAMES = ("validator", "planner", "developer", "reviewer")
 
 # Each preset is the full contents of the `factory-test.sh` wrapper `init` scaffolds.
@@ -413,6 +437,12 @@ def cmd_init(args: argparse.Namespace) -> int:
         encoding="utf-8",
     )
     print(f"wrote {workflow_path}")
+
+    issue_template_dir = root / ".github" / "ISSUE_TEMPLATE"
+    issue_template_path = issue_template_dir / "dark-factory-task.md"
+    issue_template_dir.mkdir(parents=True, exist_ok=True)
+    issue_template_path.write_text(ISSUE_TEMPLATE, encoding="utf-8")
+    print(f"wrote {issue_template_path}")
 
     project_type = args.project_type
     if project_type is None and sys.stdin.isatty():
