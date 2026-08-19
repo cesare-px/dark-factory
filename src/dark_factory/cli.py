@@ -33,7 +33,7 @@ llm:
   provider: {provider}
   model: {model}
   api_key_env: LLM_API_KEY
-
+{agent_overrides}
 budget:
   max_usd: 3.00
 
@@ -69,7 +69,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'issues' ||
       startsWith(github.event.pull_request.head.ref, 'dark-factory/')
-    uses: your-org/dark-factory/.github/workflows/orchestrate.yml@v1
+    uses: {repo}/.github/workflows/orchestrate.yml@{ref}
     with:
       event_name: ${{ github.event_name }}
       repository: ${{ github.repository }}
@@ -83,6 +83,94 @@ jobs:
 """
 
 _AGENT_NAMES = ("validator", "planner", "developer", "reviewer")
+
+# Each preset is the full contents of the `factory-test.sh` wrapper `init` scaffolds.
+# Deliberately a real repo file rather than a `.dark-factory.yml` field: once the
+# developer agent applies patches, growing the stack (e.g. python -> python+react) is
+# then just an ordinary edit to this script, reviewed like any other change -- not a
+# special permission to rewrite the config that grades its own work.
+PROJECT_TEST_HARNESS_PRESETS: dict[str, str] = {
+    "python": "#!/bin/sh\nset -e\npytest\n",
+    "node": "#!/bin/sh\nset -e\nnpm test\n",
+    "python-react": "#!/bin/sh\nset -e\npytest\nnpm --prefix frontend test\n",
+    "go": "#!/bin/sh\nset -e\ngo test ./...\n",
+    "rust": "#!/bin/sh\nset -e\ncargo test\n",
+}
+
+
+def _known_models_for_provider(provider: str) -> list[str]:
+    """List models `prices.yml` already prices for `provider`.
+
+    Keeps the init wizard from ever offering an id that later fails `dark-factory
+    doctor`'s pricing lookup. Not a live provider API call -- openai_compatible/mock
+    aren't priced here (freeform, self-hosted), and querying a real endpoint would
+    need a key before secrets even exist for a fresh repo, plus a network
+    dependency this purely local command has no other reason to have.
+    """
+    from dark_factory.pricing import _load_builtin_raw
+
+    prefix = f"{provider}:"
+    return sorted(
+        key[len(prefix) :]
+        for key in _load_builtin_raw().get("models", {})
+        if key.startswith(prefix)
+    )
+
+
+def _prompt_model_choice(provider: str, purpose: str, default: str) -> str:
+    known = _known_models_for_provider(provider)
+    if not known:
+        raw = input(f"Model for {purpose} ({provider}) [{default}]: ").strip()
+        return raw or default
+    print(f"Which model for {purpose}?")
+    for i, m in enumerate(known, 1):
+        print(f"  {i}) {m}" + ("  (default)" if m == default else ""))
+    print(f"  {len(known) + 1}) custom")
+    choice = input(f"Choice [1-{len(known) + 1}, Enter for default]: ").strip()
+    if not choice:
+        return default
+    try:
+        idx = int(choice)
+        if idx == len(known) + 1:
+            return input("Model id: ").strip()
+        return known[idx - 1]
+    except (ValueError, IndexError):
+        raise SystemExit(f"invalid choice: {choice!r}") from None
+
+
+_PROVIDER_CHOICES: tuple[tuple[str, str], ...] = (
+    ("anthropic", "Claude models via the Anthropic API"),
+    ("openai", "GPT models via the OpenAI API"),
+    ("openai_compatible", "Any OpenAI-compatible endpoint -- Ollama, vLLM, OpenRouter, ..."),
+    ("mock", "Free, deterministic mock -- zero network calls, for testing the pipeline itself"),
+)
+
+
+def _prompt_provider() -> str:
+    print("Which LLM provider?")
+    for i, (name, desc) in enumerate(_PROVIDER_CHOICES, 1):
+        marker = "  (default)" if name == "anthropic" else ""
+        print(f"  {i}) {name} -- {desc}{marker}")
+    choice = input(f"Choice [1-{len(_PROVIDER_CHOICES)}, Enter for default]: ").strip()
+    if not choice:
+        return "anthropic"
+    try:
+        return _PROVIDER_CHOICES[int(choice) - 1][0]
+    except (ValueError, IndexError):
+        raise SystemExit(f"invalid choice: {choice!r}") from None
+
+
+def _prompt_project_type() -> str | None:
+    options = [*PROJECT_TEST_HARNESS_PRESETS, "custom", "skip"]
+    print("What kind of project is this? (sets the default factory-test.sh)")
+    for i, opt in enumerate(options, 1):
+        print(f"  {i}) {opt}")
+    choice = input(f"Choice [1-{len(options)}]: ").strip()
+    try:
+        selected = options[int(choice) - 1]
+    except (ValueError, IndexError):
+        raise SystemExit(f"invalid choice: {choice!r}") from None
+    return None if selected == "skip" else selected
 
 
 def _parse_set_overrides(pairs: list[str]) -> dict[str, Any]:
@@ -256,23 +344,93 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"{config_path} already exists (use --force to overwrite)", file=sys.stderr)
         return 1
 
-    model_by_provider = {
+    provider = args.provider
+    if provider is None:
+        provider = _prompt_provider() if sys.stdin.isatty() else "anthropic"
+
+    # Reasonable per-role suggestions only -- never enforced. Each agent is picked
+    # independently below; --set/hand-editing can always change any of them later.
+    main_default = args.model or {
         "anthropic": "claude-sonnet-5",
         "openai": "gpt-5",
         "openai_compatible": "qwen2.5-coder:32b",
         "mock": "mock-default",
+    }.get(provider, "mock")
+    cheap_default = args.cheap_model or {
+        "anthropic": "claude-haiku-4-5",
+        "openai": "gpt-5-mini",
+    }.get(provider, main_default)
+    agent_defaults = {
+        "validator": cheap_default,
+        "planner": cheap_default,
+        "developer": main_default,
+        "reviewer": main_default,
     }
+
+    explicit_agent_model = {
+        "validator": args.validator_model,
+        "planner": args.planner_model,
+        "developer": args.developer_model,
+        "reviewer": args.reviewer_model,
+    }
+    agent_model = dict(agent_defaults)
+    if any(explicit_agent_model.values()):
+        agent_model.update({k: v for k, v in explicit_agent_model.items() if v})
+    elif sys.stdin.isatty():
+        for name in _AGENT_NAMES:
+            agent_model[name] = _prompt_model_choice(provider, name, agent_defaults[name])
+
+    # developer's model is the top-level default; only agents that differ from it
+    # get a named preset + override, keeping the common case (one model for
+    # everything) the same flat, no-`models:`-section file as before.
+    main_model = agent_model["developer"]
+    models_block, agents_block = "", ""
+    for name in ("validator", "planner", "reviewer"):
+        if agent_model[name] == main_model:
+            continue
+        preset = f"{name}_model"
+        models_block += (
+            f"  {preset}:\n"
+            f"    provider: {provider}\n"
+            f"    model: {agent_model[name]}\n"
+            "    api_key_env: LLM_API_KEY\n"
+        )
+        agents_block += f"  {name}:\n    use: {preset}\n"
+
+    agent_overrides = f"\nmodels:\n{models_block}\nagents:\n{agents_block}" if models_block else ""
+
     config_path.write_text(
         DEFAULT_CONFIG_TEMPLATE.format(
-            provider=args.provider, model=model_by_provider.get(args.provider, "mock")
+            provider=provider, model=main_model, agent_overrides=agent_overrides
         ),
         encoding="utf-8",
     )
     print(f"wrote {config_path}")
 
     workflow_dir.mkdir(parents=True, exist_ok=True)
-    workflow_path.write_text(CALLER_WORKFLOW_TEMPLATE, encoding="utf-8")
+    workflow_path.write_text(
+        CALLER_WORKFLOW_TEMPLATE.replace("{repo}", args.repo).replace("{ref}", args.ref),
+        encoding="utf-8",
+    )
     print(f"wrote {workflow_path}")
+
+    project_type = args.project_type
+    if project_type is None and sys.stdin.isatty():
+        project_type = _prompt_project_type()
+
+    if project_type and project_type != "skip":
+        script_path = root / "factory-test.sh"
+        if script_path.exists() and not args.force:
+            print(f"{script_path} already exists (use --force to overwrite)", file=sys.stderr)
+            return 1
+        content = PROJECT_TEST_HARNESS_PRESETS.get(project_type)
+        if content is None:  # "custom"
+            command = args.test_command or input("Test command to run: ").strip()
+            content = f"#!/bin/sh\nset -e\n{command}\n"
+        script_path.write_text(content, encoding="utf-8")
+        script_path.chmod(0o755)
+        print(f"wrote {script_path}")
+
     return 0
 
 
@@ -313,7 +471,40 @@ def build_parser() -> argparse.ArgumentParser:
     prices_p.set_defaults(func=cmd_prices)
 
     init_p = sub.add_parser("init", help="scaffold .dark-factory.yml and caller.yml into a repo")
-    init_p.add_argument("--provider", default="anthropic")
+    init_p.add_argument(
+        "--provider",
+        default=None,
+        help="LLM provider; prompts interactively if omitted on a tty, else defaults to anthropic",
+    )
+    init_p.add_argument(
+        "--model", default=None, help="default suggestion for the developer & reviewer agents"
+    )
+    init_p.add_argument(
+        "--cheap-model",
+        default=None,
+        help="default suggestion for the validator & planner agents",
+    )
+    for agent_name in _AGENT_NAMES:
+        init_p.add_argument(
+            f"--{agent_name}-model",
+            default=None,
+            help=f"explicit model for the {agent_name} agent (skips the prompt for it)",
+        )
+    init_p.add_argument(
+        "--repo", default="cesare-px/dark-factory", help="orchestrator repo caller.yml `uses:`"
+    )
+    init_p.add_argument(
+        "--ref", default="main", help="git ref of the orchestrator repo to pin caller.yml to"
+    )
+    init_p.add_argument(
+        "--project-type",
+        default=None,
+        choices=[*PROJECT_TEST_HARNESS_PRESETS, "custom", "skip"],
+        help="scaffolds factory-test.sh accordingly; prompts interactively if omitted on a tty",
+    )
+    init_p.add_argument(
+        "--test-command", default=None, help="the raw command for --project-type custom"
+    )
     init_p.add_argument("--force", action="store_true")
     init_p.set_defaults(func=cmd_init)
 
