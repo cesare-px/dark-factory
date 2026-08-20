@@ -93,7 +93,14 @@ jobs:
       - name: Checkout this orchestrator
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.core_ref || github.sha }}
+          # `repository:`/`ref:` must be explicit here -- inside a CALLED
+          # reusable workflow, github.repository and github.sha reflect the
+          # CALLING repo's context, not this workflow's own. Omitting
+          # `repository:` silently re-checked-out the downstream repo a
+          # second time into factory-core/, and github.sha was never a valid
+          # SHA in dark-factory's own history.
+          repository: cesare-px/dark-factory
+          ref: ${{ inputs.core_ref || 'main' }}
           path: factory-core
 
       - uses: actions/setup-python@v5
