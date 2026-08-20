@@ -64,6 +64,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Extract the downstream repo's bare name
+        id: repo_name
+        # `repositories:` below wants just the repo name, not "owner/repo" --
+        # `owner:` already carries the owner separately. Passing the full
+        # "owner/repo" string (as inputs.repository is, for checkout's sake)
+        # doubles the owner in the API path and 404s.
+        run: echo "value=${FULL_REPO#*/}" >> "$GITHUB_OUTPUT"
+        env:
+          FULL_REPO: ${{ inputs.repository }}
+
       - name: Mint a short-lived installation token for the downstream repo
         id: app_token
         uses: actions/create-github-app-token@v1
@@ -71,7 +81,7 @@ jobs:
           app-id: ${{ secrets.app_id }}
           private-key: ${{ secrets.app_private_key }}
           owner: ${{ github.repository_owner }}
-          repositories: ${{ inputs.repository }}
+          repositories: ${{ steps.repo_name.outputs.value }}
 
       - name: Checkout downstream project repo
         uses: actions/checkout@v4
