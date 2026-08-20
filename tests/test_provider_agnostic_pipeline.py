@@ -13,6 +13,13 @@ from dark_factory.context import ScriptedScanner
 from dark_factory.harness import ScriptedHarness
 from dark_factory.intake.schema import FactoryTicket, TicketContext
 from dark_factory.llm.client import MeteredLLMClient, build_client
+from dark_factory.llm.providers.mock import MockClient, MockScript
+
+# The reviewer now gates on the model's actual verdict text (see
+# reviewer.py's _model_approved), so every provider's fake/scripted response
+# needs to say APPROVE for this test's "identical PASS across providers"
+# premise to hold -- a bare "ok" would now (correctly) get rejected.
+_APPROVAL_TEXT = "APPROVE: looks good."
 
 
 def _ticket() -> FactoryTicket:
@@ -27,7 +34,7 @@ def _ticket() -> FactoryTicket:
 
 def _fake_anthropic_response(request):
     return {
-        "content": [{"type": "text", "text": "ok"}],
+        "content": [{"type": "text", "text": _APPROVAL_TEXT}],
         "usage": {"input_tokens": 100, "output_tokens": 50},
         "model": request.json_body["model"],
         "stop_reason": "end_turn",
@@ -36,7 +43,7 @@ def _fake_anthropic_response(request):
 
 def _fake_openai_response(request):
     return {
-        "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+        "choices": [{"message": {"content": _APPROVAL_TEXT}, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 100, "completion_tokens": 50},
         "model": request.json_body["model"],
     }
@@ -52,7 +59,7 @@ def _fake_openai_response(request):
     ],
     ids=["mock", "anthropic", "openai", "openai_compatible"],
 )
-def test_pipeline_behaves_identically_across_providers(monkeypatch, llm_overrides):
+def test_pipeline_behaves_identically_across_providers(monkeypatch, tmp_path, llm_overrides):
     monkeypatch.setenv("LLM_API_KEY", "test-key")
     monkeypatch.setattr(
         "dark_factory.llm.providers.anthropic.post_json",
@@ -71,15 +78,21 @@ def test_pipeline_behaves_identically_across_providers(monkeypatch, llm_override
 
     def deps_factory(agent_name, tracker):
         spec = cfg.resolve_llm(agent_name)
-        metered = MeteredLLMClient(build_client(spec), tracker, agent_name=agent_name)
+        raw_client = (
+            MockClient(spec, script=MockScript(responses={"reviewer": _APPROVAL_TEXT}))
+            if spec.provider == "mock"
+            else build_client(spec)
+        )
+        metered = MeteredLLMClient(raw_client, tracker, agent_name=agent_name)
         return AgentDeps(
             llm=metered,
             config=cfg,
             harness=ScriptedHarness(passes_on_attempt=1),
             scanner=ScriptedScanner(),
+            root=tmp_path,
         )
 
-    pipeline = DarkFactoryPipeline(cfg, deps_factory=deps_factory)
+    pipeline = DarkFactoryPipeline(cfg, root=tmp_path, deps_factory=deps_factory)
     result = pipeline.run(_ticket())
 
     assert result.final_status == AgentStatus.PASS

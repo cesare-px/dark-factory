@@ -118,6 +118,7 @@ class DarkFactoryPipeline:
                 ctx,
                 branch=build.output.get("branch"),
                 harness_history=tuple(build.output.get("history", ())),
+                diff_summary=build.output.get("diff_summary", ""),
             )
 
             review = ReviewerAgent(self._deps_factory("reviewer", tracker)).run(ticket, ctx)

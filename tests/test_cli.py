@@ -27,7 +27,12 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_run_dry_run_exits_zero_and_writes_report(repo: Path, capsys):
+def test_run_dry_run_exits_and_writes_report(repo: Path, capsys):
+    # --dry-run's mock provider produces no real content, so the reviewer
+    # correctly rejects it (nothing to actually approve) rather than
+    # rubber-stamping -- this smoke-tests that the pipeline's plumbing
+    # completes all four phases without crashing and without spending
+    # anything, not that mock content passes review.
     output_path = repo / "run.json"
     exit_code = main(
         [
@@ -43,9 +48,9 @@ def test_run_dry_run_exits_zero_and_writes_report(repo: Path, capsys):
             'test_harness.command=python3 -c "pass"',
         ]
     )
-    assert exit_code == 0
+    assert exit_code == 30  # reviewer rejection; see report.exit_code_for
     report = json.loads(output_path.read_text())
-    assert report["final_status"] == "pass"
+    assert report["final_status"] == "fail"
     assert report["ticket_id"] == "acme/widgets#7"
     assert report["budget"]["spent_usd"] == 0.0  # dry-run forces the free mock provider
 

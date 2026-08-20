@@ -15,6 +15,7 @@ from dark_factory.intake.schema import FactoryTicket
 from dark_factory.labels import LabelKey
 from dark_factory.llm.types import LLMRequest, Message
 from dark_factory.naming import render_branch
+from dark_factory.vcs import git_diff
 
 SYSTEM_PROMPT = (
     "You are the Developer agent in an autonomous software factory. Given an "
@@ -177,6 +178,7 @@ class DeveloperAgent(BaseAgent):
                             "iterations": iteration,
                             "history": history,
                             "summary": patch.get("summary", "") if patch else "",
+                            "diff_summary": git_diff(self.deps.root),
                         },
                         usage=self.deps.llm.total_usage,
                         cost_usd=self.deps.llm.total_cost_usd,

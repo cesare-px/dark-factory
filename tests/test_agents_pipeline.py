@@ -1,4 +1,5 @@
 import dataclasses
+from pathlib import Path
 
 from dark_factory.agents.base import AgentDeps, AgentStatus
 from dark_factory.agents.pipeline import DarkFactoryPipeline
@@ -7,6 +8,7 @@ from dark_factory.context import ScriptedScanner
 from dark_factory.harness import ScriptedHarness
 from dark_factory.intake.schema import FactoryTicket, TicketContext
 from dark_factory.llm.client import MeteredLLMClient, build_client
+from dark_factory.llm.providers.mock import MockClient, MockScript
 
 _DEFAULT_TICKET = FactoryTicket(
     ticket_id="org/project-a#1",
@@ -21,31 +23,42 @@ def _ticket(**overrides: object) -> FactoryTicket:
     return dataclasses.replace(_DEFAULT_TICKET, **overrides)  # type: ignore[arg-type]
 
 
-def _pipeline(*, config_overrides=None, passes_on_attempt=3) -> DarkFactoryPipeline:
+def _pipeline(root: Path, *, config_overrides=None, passes_on_attempt=3) -> DarkFactoryPipeline:
     """Build a pipeline wired for offline, deterministic tests.
 
     Uses the mock LLM provider, a scripted test harness (passes on the Nth
     build-test-fix attempt), and a scripted context scanner (no real repo
-    checkout needed).
+    checkout needed). `root` must be an isolated tmp_path, never the
+    implicit default `Path(".")` -- the developer agent now runs `git diff`
+    on success, and defaulting to "." would run that against dark-factory's
+    own real working checkout during a test run.
     """
     cfg = load_config(overrides=config_overrides or {})
 
     def deps_factory(agent_name, tracker):
         spec = cfg.resolve_llm(agent_name)
-        metered = MeteredLLMClient(build_client(spec), tracker, agent_name=agent_name)
+        # The reviewer now gates on the model's actual verdict text, so the
+        # mock needs to say APPROVE for a "happy path" test to mean anything.
+        raw_client = (
+            MockClient(spec, script=MockScript(responses={"reviewer": "APPROVE: looks good."}))
+            if spec.provider == "mock"
+            else build_client(spec)
+        )
+        metered = MeteredLLMClient(raw_client, tracker, agent_name=agent_name)
         return AgentDeps(
             llm=metered,
             config=cfg,
             harness=ScriptedHarness(passes_on_attempt=passes_on_attempt),
             scanner=ScriptedScanner(),
+            root=root,
         )
 
-    return DarkFactoryPipeline(cfg, deps_factory=deps_factory)
+    return DarkFactoryPipeline(cfg, root=root, deps_factory=deps_factory)
 
 
-def test_pipeline_happy_path_passes_all_phases():
+def test_pipeline_happy_path_passes_all_phases(tmp_path: Path):
     pipeline = _pipeline(
-        config_overrides={"budget": {"max_usd": 3.00}, "loop": {"max_iterations": 5}}
+        tmp_path, config_overrides={"budget": {"max_usd": 3.00}, "loop": {"max_iterations": 5}}
     )
     result = pipeline.run(_ticket())
 
@@ -58,11 +71,16 @@ def test_pipeline_happy_path_passes_all_phases():
         "reviewer",
     ]
     assert result.budget_summary["calls_recorded"] > 0
+    # tmp_path isn't a git checkout, so shipping correctly no-ops rather
+    # than erroring -- exercised for real against an actual git repo in
+    # tests/test_vcs.py.
+    reviewer_comment = result.comments[-1]
+    assert "No PR opened: not a git checkout" in reviewer_comment
 
 
-def test_pipeline_fails_fast_on_incomplete_spec():
+def test_pipeline_fails_fast_on_incomplete_spec(tmp_path: Path):
     incomplete = _ticket(description="too short", acceptance_criteria=())
-    pipeline = _pipeline()
+    pipeline = _pipeline(tmp_path)
     result = pipeline.run(incomplete)
 
     assert result.final_status == AgentStatus.FAIL
@@ -71,9 +89,11 @@ def test_pipeline_fails_fast_on_incomplete_spec():
     assert result.budget_summary["spent_usd"] == 0  # structural fail costs $0
 
 
-def test_pipeline_flags_factory_blocked_when_loop_cap_hit():
+def test_pipeline_flags_factory_blocked_when_loop_cap_hit(tmp_path: Path):
     # Cap iterations below the harness's pass-on-3rd-attempt threshold.
-    pipeline = _pipeline(config_overrides={"loop": {"max_iterations": 2}}, passes_on_attempt=3)
+    pipeline = _pipeline(
+        tmp_path, config_overrides={"loop": {"max_iterations": 2}}, passes_on_attempt=3
+    )
     result = pipeline.run(_ticket())
 
     assert result.final_status == AgentStatus.BLOCKED
@@ -81,10 +101,11 @@ def test_pipeline_flags_factory_blocked_when_loop_cap_hit():
     assert any("exceeded" in c for c in result.comments)
 
 
-def test_pipeline_flags_factory_blocked_when_budget_exhausted():
+def test_pipeline_flags_factory_blocked_when_budget_exhausted(tmp_path: Path):
     # The mock provider is free by default; override its price so a real
     # ceiling actually bites, then set the ceiling to zero.
     pipeline = _pipeline(
+        tmp_path,
         config_overrides={
             "budget": {"max_usd": 0.0},
             "pricing": {
@@ -92,7 +113,7 @@ def test_pipeline_flags_factory_blocked_when_budget_exhausted():
                     "mock:mock-default": {"input_per_mtok_usd": 1.0, "output_per_mtok_usd": 5.0}
                 }
             },
-        }
+        },
     )
     result = pipeline.run(_ticket())
 
