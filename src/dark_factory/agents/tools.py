@@ -95,7 +95,16 @@ def list_files(root: Path, pattern: str = "**/*", max_results: int = 200) -> str
     for candidate in root_resolved.glob(pattern):
         if not candidate.is_file():
             continue
-        rel = str(candidate.relative_to(root_resolved))
+        # A pattern with a literal ".." component (e.g. "../*") makes
+        # glob() yield unresolved paths like "<root>/../secret.txt" --
+        # relative_to() on that succeeds lexically (root's components are
+        # still a literal prefix) instead of raising, so containment must
+        # be checked against the *resolved* candidate, same as
+        # `_resolve_safe_path` does for every other tool.
+        candidate_resolved = candidate.resolve()
+        if not candidate_resolved.is_relative_to(root_resolved):
+            continue
+        rel = str(candidate_resolved.relative_to(root_resolved))
         if _is_excluded(rel):
             continue
         matches.append(rel)
@@ -158,13 +167,30 @@ def grep(root: Path, pattern: str, max_results: int = 100) -> str:
     return "\n".join(hits) if hits else "(no matches)"
 
 
+def _matches_command_prefix(command: str, prefix: str) -> bool:
+    """True if `command`'s leading tokens are exactly `prefix`'s tokens.
+
+    Deliberately not a raw string prefix check: `"ls".startswith` would
+    also match the unrelated binary `lsof` (`"lsof -i".startswith("ls")`
+    is True), silently authorizing anything sharing those leading
+    characters. Comparing tokens instead of characters means "ls" only
+    ever matches a command whose first word is exactly "ls".
+    """
+    try:
+        command_tokens = shlex.split(command.strip())
+        prefix_tokens = shlex.split(prefix)
+    except ValueError:
+        return False
+    return command_tokens[: len(prefix_tokens)] == prefix_tokens
+
+
 def run_command(root: Path, command: str, allowed_prefixes: tuple[str, ...]) -> str:
     """Run `command` if it matches one of `allowed_prefixes`; reject otherwise.
 
     Same safety shape as `SubprocessHarness`: no shell (`shlex.split`), a
     hard timeout, and truncated output.
     """
-    if not any(command.strip().startswith(prefix) for prefix in allowed_prefixes):
+    if not any(_matches_command_prefix(command, prefix) for prefix in allowed_prefixes):
         raise PermissionError(
             f"command not permitted: {command!r} (allowed prefixes: {list(allowed_prefixes)})"
         )

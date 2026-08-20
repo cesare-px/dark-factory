@@ -79,6 +79,23 @@ def test_list_files_matches_glob_and_respects_exclude(tmp_path):
     assert "node_modules" not in result
 
 
+def test_list_files_rejects_a_pattern_that_escapes_root(tmp_path):
+    # A literal ".." glob component makes Path.glob() yield unresolved
+    # paths like "<root>/../secret.txt" -- relative_to() on those succeeds
+    # lexically instead of raising, so this must be checked against the
+    # *resolved* candidate, same as every other tool's containment check.
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / "app.py").write_text("print(1)")
+    secret = tmp_path / "secret_outside.txt"
+    secret.write_text("TOP-SECRET-CONTENT")
+
+    result = tools.list_files(checkout, "../*")
+
+    assert "secret_outside.txt" not in result
+    assert ".." not in result
+
+
 def test_grep_falls_back_to_plain_scan_without_git(tmp_path):
     (tmp_path / "a.py").write_text("def hello():\n    return 'Hello, World!'\n")
     result = tools.grep(tmp_path, "Hello, World!")
@@ -114,3 +131,16 @@ def test_run_command_truncates_long_output(tmp_path, monkeypatch):
         tmp_path, "echo hello-world-this-is-long", allowed_prefixes=("echo",)
     )
     assert "truncated" in result
+
+
+def test_run_command_prefix_match_requires_a_word_boundary(tmp_path):
+    # A raw string-prefix check would let "ls" also authorize "lsof",
+    # since "lsof -i".startswith("ls") is True -- an unrelated binary that
+    # was never meant to be allowed.
+    assert tools._matches_command_prefix("ls -la", "ls") is True
+    assert tools._matches_command_prefix("lsof -i", "ls") is False
+
+
+def test_run_command_rejects_a_similarly_named_binary(tmp_path):
+    with pytest.raises(PermissionError):
+        tools.run_command(tmp_path, "lsof -i", allowed_prefixes=("ls",))

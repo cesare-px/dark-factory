@@ -13,6 +13,13 @@ def test_zero_config_gives_working_defaults():
     assert cfg.budget.max_usd == 3.00
     assert cfg.loop.max_iterations == 5
     assert "pytest" in cfg.tool_use.safe_command_prefixes
+    # Generic file-reading utilities must never be always-on defaults --
+    # they have no notion of "the repo" and would bypass every other
+    # tool's path containment. The dedicated read_file/list_files/grep
+    # tools cover this need safely; run_command must not re-open it.
+    assert "cat" not in cfg.tool_use.safe_command_prefixes
+    assert "ls" not in cfg.tool_use.safe_command_prefixes
+    assert "grep" not in cfg.tool_use.safe_command_prefixes
 
 
 def test_tool_use_command_families_load_from_config():

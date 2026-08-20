@@ -132,6 +132,17 @@ class ToolUseSettings:
     the issue actually has write access to the repo, checked server-side --
     never trusted from ticket content alone. `safe_command_prefixes` are
     always allowed, checkbox or not.
+
+    `run_command` (agents/tools.py) checks only that a command matches an
+    allowed prefix -- it has no awareness of which of a command's own
+    arguments might be a path, unlike read_file/write_file/edit_file/
+    list_files/grep, which all resolve and contain every path themselves.
+    Never add a generic file-reading utility (cat, less, head, tail, find,
+    ...) here or to `command_families`: those tools have no notion of "the
+    repo" and would read anything on the filesystem the process can reach.
+    The dedicated read_file/list_files/grep tools already cover that need
+    safely -- that's why they, not their shell equivalents, are in the
+    default set below.
     """
 
     enabled: bool = True
@@ -141,9 +152,6 @@ class ToolUseSettings:
         "git status",
         "git diff",
         "git log",
-        "ls",
-        "cat",
-        "grep",
     )
     command_families: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
