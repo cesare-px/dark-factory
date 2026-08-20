@@ -29,8 +29,9 @@ class RunReport:
     @classmethod
     def from_pipeline_result(cls, result: PipelineResult) -> RunReport:
         """Build a report from a completed `PipelineResult`."""
-        phases = [
-            {
+        phases = []
+        for p in result.phase_results:
+            phase: dict[str, Any] = {
                 "agent": p.agent_name,
                 "status": p.status.value,
                 "model": p.model,
@@ -42,8 +43,11 @@ class RunReport:
                     "is_estimated": p.usage.is_estimated,
                 },
             }
-            for p in result.phase_results
-        ]
+            # The build-test-fix loop is otherwise unobservable after the
+            # fact -- a failed run gives no way to see what the model tried.
+            if p.agent_name == "developer" and "history" in p.output:
+                phase["history"] = p.output["history"]
+            phases.append(phase)
         return cls(
             schema_version=REPORT_SCHEMA_VERSION,
             ticket_id=result.ticket_id,
