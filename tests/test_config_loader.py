@@ -12,6 +12,20 @@ def test_zero_config_gives_working_defaults():
     assert cfg.llm.provider == "mock"
     assert cfg.budget.max_usd == 3.00
     assert cfg.loop.max_iterations == 5
+    assert "pytest" in cfg.tool_use.safe_command_prefixes
+
+
+def test_tool_use_command_families_load_from_config():
+    cfg = load_config(
+        overrides={
+            "tool_use": {
+                "max_iterations": 12,
+                "command_families": {"Package installation": ["pip install", "npm install"]},
+            }
+        }
+    )
+    assert cfg.tool_use.max_iterations == 12
+    assert cfg.tool_use.command_families["Package installation"] == ["pip install", "npm install"]
 
 
 def test_file_beats_defaults_env_beats_file_overrides_beat_env(tmp_path: Path):

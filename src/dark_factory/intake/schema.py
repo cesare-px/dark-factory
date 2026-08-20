@@ -38,6 +38,13 @@ class FactoryTicket:
     factory_protocol_version: str = FACTORY_PROTOCOL_VERSION
     source_event_id: str | None = None
     sanitization_flags: tuple[str, ...] = field(default_factory=tuple)
+    # Checkbox labels checked in the issue body's permissions section (see
+    # intake.parser). Raw and unauthorized -- whoever consumes this (the
+    # Developer agent) must still confirm `sender_login` actually has write
+    # access to the repo before honoring any of these; a checked box is a
+    # *request*, never itself a grant.
+    requested_permissions: tuple[str, ...] = field(default_factory=tuple)
+    sender_login: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -50,6 +57,8 @@ class FactoryTicket:
             "context": self.context.to_dict(),
             "source_event_id": self.source_event_id,
             "sanitization_flags": list(self.sanitization_flags),
+            "requested_permissions": list(self.requested_permissions),
+            "sender_login": self.sender_login,
         }
 
     @property

@@ -147,3 +147,30 @@ def test_default_pr_creator_raises_on_unexpected_status(monkeypatch):
         vcs._default_pr_creator(
             repo="org/repo", branch="b", base="main", title="t", body="b", token="tok"
         )
+
+
+def test_sender_has_write_access_true_for_write_permission(monkeypatch):
+    monkeypatch.setattr(vcs, "_http_json", lambda *a, **k: (200, {"permission": "write"}))
+    assert vcs.sender_has_write_access("org/repo", "alice", "tok") is True
+
+
+def test_sender_has_write_access_false_for_read_permission(monkeypatch):
+    monkeypatch.setattr(vcs, "_http_json", lambda *a, **k: (200, {"permission": "read"}))
+    assert vcs.sender_has_write_access("org/repo", "alice", "tok") is False
+
+
+def test_sender_has_write_access_false_on_404(monkeypatch):
+    monkeypatch.setattr(vcs, "_http_json", lambda *a, **k: (404, {"message": "Not Found"}))
+    assert vcs.sender_has_write_access("org/repo", "alice", "tok") is False
+
+
+def test_sender_has_write_access_false_on_network_error(monkeypatch):
+    def raise_error(*a, **k):
+        raise vcs.GitOpsError("network down")
+
+    monkeypatch.setattr(vcs, "_http_json", raise_error)
+    assert vcs.sender_has_write_access("org/repo", "alice", "tok") is False
+
+
+def test_sender_has_write_access_false_for_empty_sender():
+    assert vcs.sender_has_write_access("org/repo", "", "tok") is False

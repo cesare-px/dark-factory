@@ -36,6 +36,7 @@ from dark_factory.config.model import (
     NamingSettings,
     PricingSettings,
     TestHarnessSettings,
+    ToolUseSettings,
 )
 
 # Raw, untyped config data as parsed from YAML/env/overrides, before any
@@ -208,6 +209,7 @@ _TOP_LEVEL_SECTIONS = (
     "labels",
     "intake",
     "pricing",
+    "tool_use",
 )
 
 
@@ -234,6 +236,7 @@ def _build_config(data: RawMapping, issues: list[ConfigIssue]) -> FactoryConfig:
         labels=_build_dataclass(data.get("labels"), LabelSettings, "labels", issues),
         intake=_build_dataclass(data.get("intake"), IntakeSettings, "intake", issues),
         pricing=_build_dataclass(data.get("pricing"), PricingSettings, "pricing", issues),
+        tool_use=_build_dataclass(data.get("tool_use"), ToolUseSettings, "tool_use", issues),
     )
 
 

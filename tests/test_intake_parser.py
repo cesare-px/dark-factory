@@ -15,12 +15,15 @@ As a user, I want JWT refresh tokens to rotate on expiration.
 """
 
 
-def _payload(body: str = ISSUE_BODY, action: str = "opened") -> dict:
-    return {
+def _payload(body: str = ISSUE_BODY, action: str = "opened", sender: str | None = None) -> dict:
+    payload = {
         "action": action,
         "issue": {"number": 101, "title": "Implement JWT Auth Refresh Tokens", "body": body},
         "repository": {"full_name": "org/project-a", "default_branch": "main"},
     }
+    if sender is not None:
+        payload["sender"] = {"login": sender}
+    return payload
 
 
 def test_parses_valid_issue_payload():
@@ -35,6 +38,32 @@ def test_parses_valid_issue_payload():
     assert ticket.context.repository == "org/project-a"
     assert ticket.context.branch_target == "main"
     assert not ticket.is_suspect
+
+
+def test_only_checked_permission_boxes_are_requested():
+    body = ISSUE_BODY + (
+        "\n## Agent Permissions\n"
+        "- [x] Package installation\n"
+        "- [ ] Network access\n"
+        "- [X] Git write commands\n"
+    )
+    ticket = parse_webhook_event(_payload(body=body), event_type="issues")
+    assert ticket.requested_permissions == ("Package installation", "Git write commands")
+
+
+def test_no_permissions_section_means_no_requested_permissions():
+    ticket = parse_webhook_event(_payload(), event_type="issues")
+    assert ticket.requested_permissions == ()
+
+
+def test_sender_login_is_extracted_when_present():
+    ticket = parse_webhook_event(_payload(sender="alice"), event_type="issues")
+    assert ticket.sender_login == "alice"
+
+
+def test_sender_login_is_none_when_absent():
+    ticket = parse_webhook_event(_payload(), event_type="issues")
+    assert ticket.sender_login is None
 
 
 def test_rejects_unsupported_event_type():

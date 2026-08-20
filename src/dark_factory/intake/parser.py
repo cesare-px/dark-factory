@@ -33,6 +33,11 @@ _SECTION_PATTERN = re.compile(
 
 _CRITERIA_ITEM_PATTERN = re.compile(r"^\s*[-*]\s*(?:\[[ xX]\]\s*)?(?P<item>.+?)\s*$", re.MULTILINE)
 
+# Unlike acceptance criteria (which take any bullet, checked or not), a
+# permission is only "requested" if its box is actually checked -- an
+# unchecked "- [ ] Package installation" must never grant anything.
+_CHECKED_ITEM_PATTERN = re.compile(r"^\s*[-*]\s*\[[xX]\]\s*(?P<item>.+?)\s*$", re.MULTILINE)
+
 
 class ParserError(ValueError):
     """Raised when a webhook payload cannot be safely parsed."""
@@ -66,6 +71,10 @@ def _find_section(sections: dict[str, str], *candidates: str) -> str:
             if candidate in heading:
                 return text
     return ""
+
+
+def _extract_checked_items(text: str) -> tuple[str, ...]:
+    return tuple(m.group("item").strip() for m in _CHECKED_ITEM_PATTERN.finditer(text))
 
 
 def _extract_acceptance_criteria(text: str) -> tuple[str, ...]:
@@ -133,6 +142,17 @@ def parse_webhook_event(
 
     all_flags = (*title_report.flags, *description_report.flags, *criteria_report.flags)
 
+    # Raw and unauthorized -- only used as a lookup key against the
+    # configured command_families catalog, never shown to an LLM prompt, so
+    # it doesn't go through sanitize_text like title/description/criteria
+    # do. Authorization (does `sender` actually have write access?) happens
+    # later, adjacent to where it's spent -- see vcs.sender_has_write_access.
+    raw_permissions_block = _find_section(sections, *aliases.get("permissions", ()))
+    requested_permissions = _extract_checked_items(raw_permissions_block)
+
+    sender = payload.get("sender")
+    sender_login = sender.get("login") if isinstance(sender, dict) else None
+
     return FactoryTicket(
         ticket_id=f"{repo_full_name}#{issue_number}",
         title=title_report.clean_text or "(untitled)",
@@ -141,4 +161,6 @@ def parse_webhook_event(
         context=TicketContext(repository=repo_full_name, branch_target=branch_target),
         source_event_id=source_event_id,
         sanitization_flags=all_flags,
+        requested_permissions=requested_permissions,
+        sender_login=sender_login if isinstance(sender_login, str) else None,
     )

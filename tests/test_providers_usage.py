@@ -7,7 +7,14 @@ recorded response shapes.
 
 from dark_factory.config.model import ResolvedLLM
 from dark_factory.llm.providers import anthropic, openai
-from dark_factory.llm.types import LLMRequest, Message
+from dark_factory.llm.types import (
+    LLMRequest,
+    Message,
+    TextBlock,
+    ToolCall,
+    ToolDefinition,
+    ToolResultBlock,
+)
 
 
 def _spec(provider: str, model: str) -> ResolvedLLM:
@@ -62,6 +69,71 @@ def test_anthropic_parse_response_concatenates_multiple_text_blocks():
     raw = {"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}], "usage": {}}
     response = anthropic.parse_response(raw, spec)
     assert response.text == "ab"
+
+
+def test_anthropic_build_payload_includes_tool_definitions():
+    spec = _spec("anthropic", "claude-sonnet-5")
+    tool = ToolDefinition(
+        name="read_file", description="Read a file", input_schema={"type": "object"}
+    )
+    request = LLMRequest(messages=(Message("user", "hi"),), tools=(tool,))
+    payload = anthropic.build_payload(request, spec)
+    assert payload["tools"] == [
+        {"name": "read_file", "description": "Read a file", "input_schema": {"type": "object"}}
+    ]
+
+
+def test_anthropic_build_payload_translates_content_blocks():
+    spec = _spec("anthropic", "claude-sonnet-5")
+    request = LLMRequest(
+        messages=(
+            Message(
+                "assistant",
+                (
+                    TextBlock("checking"),
+                    ToolCall(id="t1", name="read_file", input={"path": "a.py"}),
+                ),
+            ),
+            Message("user", (ToolResultBlock(tool_call_id="t1", content="contents of a.py"),)),
+        )
+    )
+    payload = anthropic.build_payload(request, spec)
+    assert payload["messages"][0]["content"] == [
+        {"type": "text", "text": "checking"},
+        {"type": "tool_use", "id": "t1", "name": "read_file", "input": {"path": "a.py"}},
+    ]
+    assert payload["messages"][1]["content"] == [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "contents of a.py"}
+    ]
+
+
+def test_anthropic_build_payload_marks_error_tool_results():
+    spec = _spec("anthropic", "claude-sonnet-5")
+    request = LLMRequest(
+        messages=(
+            Message(
+                "user", (ToolResultBlock(tool_call_id="t1", content="no such file", is_error=True),)
+            ),
+        )
+    )
+    payload = anthropic.build_payload(request, spec)
+    assert payload["messages"][0]["content"][0]["is_error"] is True
+
+
+def test_anthropic_parse_response_extracts_tool_calls():
+    spec = _spec("anthropic", "claude-sonnet-5")
+    raw = {
+        "content": [
+            {"type": "text", "text": "let me check"},
+            {"type": "tool_use", "id": "t1", "name": "read_file", "input": {"path": "a.py"}},
+        ],
+        "usage": {},
+        "stop_reason": "tool_use",
+    }
+    response = anthropic.parse_response(raw, spec)
+    assert response.text == "let me check"
+    assert response.finish_reason == "tool_use"
+    assert response.tool_calls == (ToolCall(id="t1", name="read_file", input={"path": "a.py"}),)
 
 
 def test_openai_build_payload_prepends_system_message():

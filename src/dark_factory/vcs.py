@@ -194,3 +194,28 @@ def _default_pr_creator(
         if status2 == 200 and existing:
             return str(existing[0]["html_url"])
     raise GitOpsError(f"GitHub API error creating PR for {repo}@{branch}: HTTP {status} {data}")
+
+
+_WRITE_PERMISSIONS = frozenset({"admin", "maintain", "write"})
+
+
+def sender_has_write_access(repo: str, sender: str, token: str) -> bool:
+    """True if `sender` has at least write access to `repo`.
+
+    Gates whether a ticket's checked permission boxes (see
+    `intake.parser`) are actually honored, rather than trusted from ticket
+    content alone. Fails closed on any error -- missing `sender`, a
+    network failure, or an unexpected response all mean "no", never "yes
+    by default".
+    """
+    if not sender:
+        return False
+    try:
+        status, data = _http_json(
+            "GET", f"https://api.github.com/repos/{repo}/collaborators/{sender}/permission", token
+        )
+    except GitOpsError:
+        return False
+    if status != 200 or not isinstance(data, dict):
+        return False
+    return data.get("permission") in _WRITE_PERMISSIONS

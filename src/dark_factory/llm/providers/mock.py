@@ -12,27 +12,43 @@ from dataclasses import dataclass, field
 from dark_factory.config.model import ResolvedLLM
 from dark_factory.llm.errors import LLMTransientError
 from dark_factory.llm.tokens import estimate_usage_from_text
-from dark_factory.llm.types import LLMRequest, LLMResponse, TokenUsage
+from dark_factory.llm.types import LLMRequest, LLMResponse, TokenUsage, ToolCall, message_text
+
+
+@dataclass(frozen=True, slots=True)
+class ScriptedResponse:
+    """A scripted response carrying actual `tool_calls`, not just text.
+
+    Needed to script a tool-use conversation (e.g. for `tool_loop.py`
+    tests): a plain string can't represent "the model called this tool".
+    """
+
+    text: str = ""
+    tool_calls: tuple[ToolCall, ...] = ()
+
+
+ScriptedEntry = str | ScriptedResponse
 
 
 @dataclass
 class MockScript:
     """Canned completions keyed by `request.metadata["agent"]`, with a "*" fallback.
 
-    Each value is either a single string (repeated every call) or a list
-    consumed one-per-call (the last entry repeats once exhausted).
+    Each value is either a single entry (repeated every call) or a list
+    consumed one-per-call (the last entry repeats once exhausted). An entry
+    is plain text, or a `ScriptedResponse` for a turn that calls tools.
     """
 
-    responses: dict[str, str | list[str]] = field(default_factory=dict)
+    responses: dict[str, ScriptedEntry | list[ScriptedEntry]] = field(default_factory=dict)
     fixed_usage: TokenUsage | None = None
     fail_on_call: int | None = None  # 1-indexed call number (per agent) to fail
 
-    def response_for(self, agent: str, call_index: int) -> str:
-        """Return the scripted response text for `agent`'s `call_index`-th call."""
+    def response_for(self, agent: str, call_index: int) -> ScriptedEntry:
+        """Return the scripted response for `agent`'s `call_index`-th call."""
         script = self.responses.get(agent, self.responses.get("*"))
         if script is None:
             return f"[mock response for {agent}, call {call_index + 1}]"
-        if isinstance(script, str):
+        if isinstance(script, str | ScriptedResponse):
             return script
         return script[min(call_index, len(script) - 1)]
 
@@ -57,14 +73,23 @@ class MockClient:
         if self._script.fail_on_call is not None and call_index + 1 == self._script.fail_on_call:
             raise LLMTransientError(f"mock: injected failure on {agent} call {call_index + 1}")
 
-        text = self._script.response_for(agent, call_index)
+        scripted = self._script.response_for(agent, call_index)
+        text, tool_calls = (
+            (scripted.text, scripted.tool_calls)
+            if isinstance(scripted, ScriptedResponse)
+            else (scripted, ())
+        )
         if self._script.fixed_usage is not None:
             usage = self._script.fixed_usage
         else:
-            prompt_text = (request.system or "") + "".join(m.content for m in request.messages)
+            prompt_text = (request.system or "") + "".join(
+                message_text(m.content) for m in request.messages
+            )
             usage = estimate_usage_from_text(prompt_text, text)
 
-        return LLMResponse(text=text, usage=usage, provider=self.provider, model=self.model)
+        return LLMResponse(
+            text=text, usage=usage, provider=self.provider, model=self.model, tool_calls=tool_calls
+        )
 
     def close(self) -> None:
         """No resources to release for this in-memory client."""

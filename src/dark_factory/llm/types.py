@@ -7,6 +7,7 @@ is what lets agents, the budget tracker, and tests stay provider-blind.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -14,11 +15,74 @@ Role = Literal["system", "user", "assistant"]
 
 
 @dataclass(frozen=True, slots=True)
+class ToolDefinition:
+    """One tool the model may call, described as a JSON-schema input contract."""
+
+    name: str
+    description: str
+    input_schema: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    """One invocation of a tool, as requested by the model."""
+
+    id: str
+    name: str
+    input: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResultBlock:
+    """The result of running one `ToolCall`, fed back to the model."""
+
+    tool_call_id: str
+    content: str
+    is_error: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class TextBlock:
+    """Plain text content within a message."""
+
+    text: str
+
+
+ContentBlock = TextBlock | ToolCall | ToolResultBlock
+
+
+@dataclass(frozen=True, slots=True)
 class Message:
-    """One chat message in a provider-agnostic request."""
+    """One chat message in a provider-agnostic request.
+
+    `content` is plain text for an ordinary turn, or a tuple of content
+    blocks for a tool-use turn: the model's own `ToolCall`s from a prior
+    response, or `ToolResultBlock`s reporting what running them produced.
+    """
 
     role: Role
-    content: str
+    content: str | tuple[ContentBlock, ...]
+
+
+def message_text(content: str | tuple[ContentBlock, ...]) -> str:
+    """Best-effort plain-text rendering of `Message.content`.
+
+    For providers/estimators that don't understand tool content blocks yet
+    (openai, openai_compatible, mock -- tool support is Anthropic-only for
+    now). Never raises; a tool call/result renders as a short bracketed
+    placeholder rather than being silently dropped.
+    """
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, TextBlock):
+            parts.append(block.text)
+        elif isinstance(block, ToolCall):
+            parts.append(f"[tool_call {block.name}]")
+        else:
+            parts.append(block.content)
+    return "\n".join(parts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +125,7 @@ class LLMRequest:
     max_output_tokens: int = 4096
     temperature: float | None = None
     metadata: dict[str, str] = field(default_factory=dict)
+    tools: tuple[ToolDefinition, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,4 +137,5 @@ class LLMResponse:
     provider: str
     model: str
     finish_reason: str = "stop"
+    tool_calls: tuple[ToolCall, ...] = ()
     raw: Any = field(default=None, repr=False, compare=False)

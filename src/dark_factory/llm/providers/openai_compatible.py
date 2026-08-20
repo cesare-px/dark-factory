@@ -17,7 +17,7 @@ from dark_factory.config.model import ResolvedLLM
 from dark_factory.llm.providers.openai import OpenAIClient, build_payload, parse_response
 from dark_factory.llm.tokens import estimate_usage_from_text
 from dark_factory.llm.transport import HttpRequest, RetryPolicy, post_json
-from dark_factory.llm.types import LLMRequest, LLMResponse
+from dark_factory.llm.types import LLMRequest, LLMResponse, message_text
 
 # Verified against each provider's official docs at implementation time.
 PRESETS: dict[str, str] = {
@@ -71,7 +71,9 @@ class OpenAICompatibleClient(OpenAIClient):
         if response.usage.is_estimated or (
             response.usage.input_tokens == 0 and response.usage.output_tokens == 0
         ):
-            prompt_text = (request.system or "") + "".join(m.content for m in request.messages)
+            prompt_text = (request.system or "") + "".join(
+                message_text(m.content) for m in request.messages
+            )
             response = LLMResponse(
                 text=response.text,
                 usage=estimate_usage_from_text(prompt_text, response.text),

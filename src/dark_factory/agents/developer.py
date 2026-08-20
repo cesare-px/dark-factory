@@ -2,92 +2,166 @@
 
 from __future__ import annotations
 
-import json
-import re
+import os
 from pathlib import Path
 from typing import Any
 
+from dark_factory.agents import tools
 from dark_factory.agents.base import AgentDeps, AgentResult, AgentStatus, BaseAgent, RunContext
+from dark_factory.agents.tool_loop import ToolLoopLimitExceededError, ToolSpec, run_tool_loop
+from dark_factory.config.model import ToolUseSettings
 from dark_factory.guardrails.budget import BudgetExceededError
 from dark_factory.guardrails.loop_tracker import IterationLoopTracker, LoopLimitExceededError
 from dark_factory.intake.sanitize import sanitize_text, wrap_as_untrusted
 from dark_factory.intake.schema import FactoryTicket
 from dark_factory.labels import LabelKey
-from dark_factory.llm.types import LLMRequest, Message
+from dark_factory.llm.types import ToolDefinition
 from dark_factory.naming import render_branch
-from dark_factory.vcs import git_diff
+from dark_factory.vcs import git_diff, sender_has_write_access
 
 SYSTEM_PROMPT = (
     "You are the Developer agent in an autonomous software factory. Given an "
-    "implementation plan and (on retries) the previous test failure, reply "
-    "with ONLY a JSON object of the form "
-    '{"files": [{"path": "relative/path.py", "content": "full file contents"}], '
-    '"summary": "one-line description of the change"}'
-    " -- the complete desired contents of every file that needs to exist or "
-    "change to satisfy the plan. No prose, no markdown fences, just the JSON."
+    "implementation plan and (on retries) the previous test failure, use the "
+    "available tools to explore the codebase and make the necessary changes. "
+    "Call finish_implementation with a summary once you believe the work is "
+    "complete -- the test harness decides whether it actually passes, not you."
 )
 
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+FINISH_TOOL = ToolDefinition(
+    name="finish_implementation",
+    description="Call this once you believe your changes satisfy the plan.",
+    input_schema={
+        "type": "object",
+        "properties": {"summary": {"type": "string", "description": "What you changed, and why."}},
+        "required": ["summary"],
+    },
+)
 
 
-def _parse_patch(text: str) -> dict[str, Any] | None:
-    """Extract the `{"files": [...]}` object from a developer response.
+def _build_tools(root: Path, allowed_command_prefixes: tuple[str, ...]) -> tuple[ToolSpec, ...]:
+    """The Developer's full tool set: read/search/write/edit plus a permission-gated run_command."""
+    return (
+        ToolSpec(
+            definition=ToolDefinition(
+                name="read_file",
+                description="Read a file's contents, given a path relative to the project root.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            ),
+            handler=lambda path: tools.read_file(root, path),
+        ),
+        ToolSpec(
+            definition=ToolDefinition(
+                name="list_files",
+                description="List files under the project root matching a glob pattern.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"pattern": {"type": "string"}},
+                    "required": ["pattern"],
+                },
+            ),
+            handler=lambda pattern: tools.list_files(root, pattern),
+        ),
+        ToolSpec(
+            definition=ToolDefinition(
+                name="grep",
+                description="Search file contents under the project root for a substring.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"pattern": {"type": "string"}},
+                    "required": ["pattern"],
+                },
+            ),
+            handler=lambda pattern: tools.grep(root, pattern),
+        ),
+        ToolSpec(
+            definition=ToolDefinition(
+                name="write_file",
+                description=(
+                    "Write the complete contents of a file, creating it (and any parent "
+                    "directories) if it doesn't exist yet. Use edit_file instead for a "
+                    "targeted change to a file that already exists."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                    "required": ["path", "content"],
+                },
+            ),
+            handler=lambda path, content: tools.write_file(root, path, content),
+        ),
+        ToolSpec(
+            definition=ToolDefinition(
+                name="edit_file",
+                description=(
+                    "Replace exactly one occurrence of old_string with new_string in an "
+                    "existing file. old_string must match exactly once in the file -- "
+                    "include enough surrounding context to make it unique."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"},
+                    },
+                    "required": ["path", "old_string", "new_string"],
+                },
+            ),
+            handler=lambda path, old_string, new_string: tools.edit_file(
+                root, path, old_string, new_string
+            ),
+        ),
+        ToolSpec(
+            definition=ToolDefinition(
+                name="run_command",
+                description=(
+                    "Run a shell command to check your work (e.g. a linter, a syntax "
+                    "check, or a build step). Only a limited, pre-approved set of "
+                    "commands is allowed; a rejected command is not a bug, it's a "
+                    "permission this ticket didn't request."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            ),
+            handler=lambda command: tools.run_command(root, command, allowed_command_prefixes),
+        ),
+    )
 
-    Tries a fenced ```json block first, then the whole response, so a model
-    that wraps its answer in prose still parses. Returns None (never raises)
-    on anything that isn't a well-formed `files` list, so a malformed
-    response degrades to "no files written this attempt" rather than
-    crashing the pipeline.
+
+def _resolve_allowed_command_prefixes(
+    ticket: FactoryTicket, cfg: ToolUseSettings
+) -> tuple[str, ...]:
+    """Safe defaults, plus any authorized per-ticket command family.
+
+    A checked box is a request, never a grant: no `GITHUB_TOKEN` (a local
+    run), no `sender_login`, or the sender lacking write access on the repo
+    all mean the request is silently dropped, not an error -- the run
+    proceeds with just the safe defaults.
     """
-    candidates = []
-    fence_match = _JSON_FENCE_RE.search(text)
-    if fence_match:
-        candidates.append(fence_match.group(1))
-    candidates.append(text.strip())
+    prefixes = list(cfg.safe_command_prefixes)
+    if not ticket.requested_permissions:
+        return tuple(prefixes)
 
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict) and isinstance(parsed.get("files"), list):
-            return parsed
-    return None
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token or not ticket.sender_login:
+        return tuple(prefixes)
+    if not sender_has_write_access(ticket.context.repository, ticket.sender_login, token):
+        return tuple(prefixes)
 
-
-def _write_files(files: list[Any], root: Path) -> tuple[list[str], list[str]]:
-    """Write each `{"path", "content"}` entry under `root`; refuse escapes.
-
-    Returns `(written, rejected)` relative-path strings. A path that resolves
-    outside `root` (via ".." or an absolute path) is skipped, not written --
-    this executes LLM-authored content on disk, so escaping the sandboxed
-    checkout is never acceptable regardless of what the model asked for.
-    """
-    written: list[str] = []
-    rejected: list[str] = []
-    root_resolved = root.resolve()
-
-    for entry in files:
-        if not isinstance(entry, dict):
-            continue
-        rel_path, content = entry.get("path"), entry.get("content")
-        if not isinstance(rel_path, str) or not isinstance(content, str):
-            continue
-
-        target = (root / rel_path).resolve()
-        if not target.is_relative_to(root_resolved):
-            rejected.append(rel_path)
-            continue
-
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        written.append(rel_path)
-
-    return written, rejected
+    for label in ticket.requested_permissions:
+        prefixes.extend(cfg.command_families.get(label, ()))
+    return tuple(prefixes)
 
 
 class DeveloperAgent(BaseAgent):
-    """Runs the bounded build-test-fix loop against a technical plan."""
+    """Runs the bounded build-test-fix loop, giving the model real tool access."""
 
     name = "developer"
 
@@ -103,19 +177,14 @@ class DeveloperAgent(BaseAgent):
         if not history:
             return ""
         last = history[-1]
-        if last.get("parse_error"):
+        if last.get("tool_loop_error"):
             raw = (
-                "Your previous response could not be parsed as the required "
-                'JSON {"files": [...]} object. Reply with ONLY that JSON -- '
-                "no prose, no markdown fences."
+                "Your previous attempt did not finish cleanly: "
+                f"{last['tool_loop_error']}. Be more decisive about calling "
+                "finish_implementation once you've made your changes."
             )
         else:
             raw = last["stderr"] or last["stdout"]
-            if last.get("rejected_files"):
-                raw = (
-                    f"Rejected paths outside the project root: "
-                    f"{last['rejected_files']}. Use only paths inside the checkout.\n{raw}"
-                )
         report = sanitize_text(raw, field_name="harness_output")
         return wrap_as_untrusted(report.clean_text, label="TEST_HARNESS_OUTPUT")
 
@@ -126,50 +195,55 @@ class DeveloperAgent(BaseAgent):
         harness = self.deps.harness
         if harness is None:
             raise ValueError(f"{self.name} agent requires a test harness, but none was configured")
-        spec = self.deps.config.resolve_llm(self.name)
         workdir = Path(self.deps.config.test_harness.working_dir)
+
+        tool_use_cfg = self.deps.config.tool_use
+        allowed_prefixes = _resolve_allowed_command_prefixes(ticket, tool_use_cfg)
+        tool_registry = _build_tools(self.deps.root, allowed_prefixes)
 
         try:
             while True:
                 iteration = self.loop_tracker.step()
 
                 feedback = self._feedback_block(history)
-                prompt = wrap_as_untrusted(f"Plan: {list(ctx.plan_steps)}\nAttempt: {iteration}")
-                if feedback:
-                    prompt = f"{prompt}\n{feedback}"
-
-                request = LLMRequest(
-                    system=SYSTEM_PROMPT,
-                    messages=(Message("user", prompt),),
-                    max_output_tokens=spec.max_output_tokens,
-                    temperature=spec.temperature,
-                    metadata={"agent": self.name},
+                first_message = wrap_as_untrusted(
+                    f"Plan: {list(ctx.plan_steps)}\nAttempt: {iteration}"
                 )
-                response = self.deps.llm.complete(request)
+                if feedback:
+                    first_message = f"{first_message}\n{feedback}"
 
-                patch = _parse_patch(response.text)
-                written: list[str] = []
-                rejected: list[str] = []
-                if patch is not None:
-                    written, rejected = _write_files(patch.get("files", []), self.deps.root)
+                summary = ""
+                tool_loop_error: str | None = None
+                if tool_use_cfg.enabled:
+                    try:
+                        loop_result = run_tool_loop(
+                            self.deps.llm,
+                            system=SYSTEM_PROMPT,
+                            first_message=first_message,
+                            tools=tool_registry,
+                            finish_tool=FINISH_TOOL,
+                            max_iterations=tool_use_cfg.max_iterations,
+                            metadata={"agent": self.name},
+                        )
+                        summary = str(loop_result.finish_input.get("summary", ""))
+                    except ToolLoopLimitExceededError as exc:
+                        tool_loop_error = str(exc)
+                else:
+                    tool_loop_error = "tool_use is disabled for this repo"
 
-                result = harness.run(iteration=iteration, workdir=workdir)
+                harness_result = harness.run(iteration=iteration, workdir=workdir)
                 history.append(
                     {
                         "iteration": iteration,
-                        "passed": result.passed,
-                        "stdout": result.stdout,
-                        "stderr": result.stderr,
-                        "parse_error": patch is None,
-                        "written_files": written,
-                        "rejected_files": rejected,
-                        # Otherwise a failed loop is unobservable after the
-                        # fact -- nothing else records what the model said.
-                        "raw_response": response.text,
+                        "passed": harness_result.passed,
+                        "stdout": harness_result.stdout,
+                        "stderr": harness_result.stderr,
+                        "tool_loop_error": tool_loop_error,
+                        "summary": summary,
                     }
                 )
 
-                if result.passed:
+                if harness_result.passed:
                     return AgentResult(
                         agent_name=self.name,
                         status=AgentStatus.PASS,
@@ -177,7 +251,7 @@ class DeveloperAgent(BaseAgent):
                             "branch": branch,
                             "iterations": iteration,
                             "history": history,
-                            "summary": patch.get("summary", "") if patch else "",
+                            "summary": summary,
                             "diff_summary": git_diff(self.deps.root),
                         },
                         usage=self.deps.llm.total_usage,

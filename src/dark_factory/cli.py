@@ -34,6 +34,13 @@ llm:
   model: {model}
   api_key_env: LLM_API_KEY
 {agent_overrides}
+tool_use:
+  # Checkbox labels here must match the issue template's "Agent
+  # Permissions" section exactly -- init generates both from the same
+  # catalog so they can't drift apart. A checked box only takes effect if
+  # the person who checked it actually has write access to this repo.
+  command_families:
+{command_families_yaml}
 budget:
   max_usd: 3.00
 
@@ -105,7 +112,26 @@ labels: []
 
 -
 -
+
+## Agent Permissions (optional)
+
+<!-- Everything the Developer agent needs for a normal ticket is already
+allowed by default. Check a box below ONLY if this ticket genuinely needs
+one of these -- and note that a checked box still only takes effect if you
+(whoever last edited this issue) have write access to this repo; it's
+verified against GitHub, not just trusted because the box is checked. -->
+
+{permissions_checklist}
 """
+
+# Command families init offers by default, matching .dark-factory.yml's
+# tool_use.command_families -- edit both together, or `init --force` to
+# regenerate from a hand-edited config (see `_command_families_yaml`).
+DEFAULT_COMMAND_FAMILIES: dict[str, list[str]] = {
+    "Package installation": ["pip install", "npm install", "npm ci"],
+    "Git write commands": ["git commit", "git branch", "git add"],
+    "Network access": ["curl", "wget"],
+}
 
 _AGENT_NAMES = ("validator", "planner", "developer", "reviewer")
 
@@ -196,6 +222,29 @@ def _prompt_project_type() -> str | None:
     except (ValueError, IndexError):
         raise SystemExit(f"invalid choice: {choice!r}") from None
     return None if selected == "skip" else selected
+
+
+def _command_families_yaml(catalog: dict[str, list[str]]) -> str:
+    """Render `catalog` as a nested YAML block.
+
+    For `.dark-factory.yml`'s `tool_use.command_families`, at the indent
+    that key expects.
+    """
+    lines = []
+    for label, prefixes in catalog.items():
+        lines.append(f"    {label}:")
+        lines.extend(f"      - {prefix}" for prefix in prefixes)
+    return "\n".join(lines)
+
+
+def _permissions_checklist(catalog: dict[str, list[str]]) -> str:
+    """Render `catalog`'s labels as unchecked issue-template checkboxes.
+
+    Must stay label-for-label identical to `_command_families_yaml`'s keys
+    -- that's what lets a checked box actually map to a real command
+    family instead of being silently ignored as unrecognized.
+    """
+    return "\n".join(f"- [ ] {label}" for label in catalog)
 
 
 def _parse_set_overrides(pairs: list[str]) -> dict[str, Any]:
@@ -426,7 +475,10 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     config_path.write_text(
         DEFAULT_CONFIG_TEMPLATE.format(
-            provider=provider, model=main_model, agent_overrides=agent_overrides
+            provider=provider,
+            model=main_model,
+            agent_overrides=agent_overrides,
+            command_families_yaml=_command_families_yaml(DEFAULT_COMMAND_FAMILIES),
         ),
         encoding="utf-8",
     )
@@ -442,7 +494,12 @@ def cmd_init(args: argparse.Namespace) -> int:
     issue_template_dir = root / ".github" / "ISSUE_TEMPLATE"
     issue_template_path = issue_template_dir / "dark-factory-task.md"
     issue_template_dir.mkdir(parents=True, exist_ok=True)
-    issue_template_path.write_text(ISSUE_TEMPLATE, encoding="utf-8")
+    issue_template_path.write_text(
+        ISSUE_TEMPLATE.format(
+            permissions_checklist=_permissions_checklist(DEFAULT_COMMAND_FAMILIES)
+        ),
+        encoding="utf-8",
+    )
     print(f"wrote {issue_template_path}")
 
     project_type = args.project_type

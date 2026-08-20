@@ -14,7 +14,7 @@ from typing import Any
 from dark_factory.config.model import ResolvedLLM
 from dark_factory.llm.errors import LLMAuthError
 from dark_factory.llm.transport import HttpRequest, RetryPolicy, post_json
-from dark_factory.llm.types import LLMRequest, LLMResponse, TokenUsage
+from dark_factory.llm.types import LLMRequest, LLMResponse, TokenUsage, message_text
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
@@ -24,7 +24,7 @@ def build_payload(request: LLMRequest, spec: ResolvedLLM) -> dict[str, Any]:
     messages = []
     if request.system:
         messages.append({"role": "system", "content": request.system})
-    messages.extend({"role": m.role, "content": m.content} for m in request.messages)
+    messages.extend({"role": m.role, "content": message_text(m.content)} for m in request.messages)
 
     payload: dict[str, Any] = {
         "model": spec.model,

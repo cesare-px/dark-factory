@@ -14,10 +14,43 @@ from typing import Any
 from dark_factory.config.model import ResolvedLLM
 from dark_factory.llm.errors import LLMAuthError
 from dark_factory.llm.transport import HttpRequest, RetryPolicy, post_json
-from dark_factory.llm.types import LLMRequest, LLMResponse, TokenUsage
+from dark_factory.llm.types import (
+    ContentBlock,
+    LLMRequest,
+    LLMResponse,
+    TextBlock,
+    TokenUsage,
+    ToolCall,
+)
 
 API_VERSION = "2023-06-01"
 DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
+
+
+def _content_block_to_anthropic(block: ContentBlock) -> dict[str, Any]:
+    if isinstance(block, TextBlock):
+        return {"type": "text", "text": block.text}
+    if isinstance(block, ToolCall):
+        return {
+            "type": "tool_use",
+            "id": block.id,
+            "name": block.name,
+            "input": dict(block.input),
+        }
+    result: dict[str, Any] = {
+        "type": "tool_result",
+        "tool_use_id": block.tool_call_id,
+        "content": block.content,
+    }
+    if block.is_error:
+        result["is_error"] = True
+    return result
+
+
+def _message_content_to_anthropic(content: str | tuple[ContentBlock, ...]) -> Any:
+    if isinstance(content, str):
+        return content
+    return [_content_block_to_anthropic(block) for block in content]
 
 
 def build_payload(request: LLMRequest, spec: ResolvedLLM) -> dict[str, Any]:
@@ -25,12 +58,20 @@ def build_payload(request: LLMRequest, spec: ResolvedLLM) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": spec.model,
         "max_tokens": request.max_output_tokens,
-        "messages": [{"role": m.role, "content": m.content} for m in request.messages],
+        "messages": [
+            {"role": m.role, "content": _message_content_to_anthropic(m.content)}
+            for m in request.messages
+        ],
     }
     if request.system:
         payload["system"] = request.system
     if request.temperature is not None:
         payload["temperature"] = request.temperature
+    if request.tools:
+        payload["tools"] = [
+            {"name": t.name, "description": t.description, "input_schema": dict(t.input_schema)}
+            for t in request.tools
+        ]
     return payload
 
 
@@ -46,8 +87,12 @@ def parse_usage(raw_usage: Mapping[str, Any]) -> TokenUsage:
 
 def parse_response(raw: Mapping[str, Any], spec: ResolvedLLM) -> LLMResponse:
     """Translate a raw Messages API response into an `LLMResponse`."""
-    text = "".join(
-        block.get("text", "") for block in raw.get("content", []) if block.get("type") == "text"
+    content = raw.get("content", [])
+    text = "".join(block.get("text", "") for block in content if block.get("type") == "text")
+    tool_calls = tuple(
+        ToolCall(id=block["id"], name=block["name"], input=block.get("input", {}))
+        for block in content
+        if block.get("type") == "tool_use"
     )
     return LLMResponse(
         text=text,
@@ -55,6 +100,7 @@ def parse_response(raw: Mapping[str, Any], spec: ResolvedLLM) -> LLMResponse:
         provider="anthropic",
         model=raw.get("model", spec.model),
         finish_reason=raw.get("stop_reason") or "stop",
+        tool_calls=tool_calls,
         raw=raw,
     )
 

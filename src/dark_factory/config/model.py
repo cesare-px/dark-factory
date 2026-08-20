@@ -16,6 +16,7 @@ from typing import Literal, cast
 DEFAULT_SECTION_ALIASES: Mapping[str, tuple[str, ...]] = {
     "description": ("user story", "description", "summary"),
     "acceptance_criteria": ("acceptance criteria",),
+    "permissions": ("agent permissions", "permissions"),
 }
 
 
@@ -122,6 +123,32 @@ class IntakeSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolUseSettings:
+    """Bounds and per-ticket permissions for the Planner/Developer tool-use loop.
+
+    `command_families` catalogs checkbox labels (matched against a ticket's
+    checked boxes -- see `intake.parser`) to the extra command prefixes each
+    unlocks. A checked box is only honored if the sender who opened/edited
+    the issue actually has write access to the repo, checked server-side --
+    never trusted from ticket content alone. `safe_command_prefixes` are
+    always allowed, checkbox or not.
+    """
+
+    enabled: bool = True
+    max_iterations: int = 8
+    safe_command_prefixes: tuple[str, ...] = (
+        "pytest",
+        "git status",
+        "git diff",
+        "git log",
+        "ls",
+        "cat",
+        "grep",
+    )
+    command_families: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class PricingSettings:
     """Pricing overrides and the policy for models missing from the price book."""
 
@@ -160,6 +187,7 @@ class FactoryConfig:
     labels: LabelSettings = field(default_factory=LabelSettings)
     intake: IntakeSettings = field(default_factory=IntakeSettings)
     pricing: PricingSettings = field(default_factory=PricingSettings)
+    tool_use: ToolUseSettings = field(default_factory=ToolUseSettings)
     provenance: Mapping[str, str] = field(default_factory=dict)
 
     def resolve_llm(self, agent_name: str) -> ResolvedLLM:
