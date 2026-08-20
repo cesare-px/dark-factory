@@ -39,6 +39,7 @@ on:
     inputs:
       issue_number:
         description: "Issue number to (re-)run the factory against"
+        type: number
         required: true
 
 permissions:

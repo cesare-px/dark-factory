@@ -54,6 +54,7 @@ on:
   workflow_dispatch:
     inputs:
       issue_number:
+        type: number
         required: true
 permissions:
   contents: read
