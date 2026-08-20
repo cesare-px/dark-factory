@@ -150,6 +150,13 @@ jobs:
           labels=$(python3 -c "import json;print(','.join(json.load(open('run-report.json'))['labels']))")
           comments=$(python3 -c "import json;print('\n\n---\n\n'.join(json.load(open('run-report.json'))['comments']))")
           if [ -n "$labels" ]; then
+            # `gh issue edit --add-label` fails on a label that doesn't exist
+            # yet in the repo -- create (or no-op update) each one first so
+            # a fresh repo's first run doesn't silently drop every label.
+            IFS=',' read -ra label_array <<< "$labels"
+            for label in "${label_array[@]}"; do
+              gh label create "$label" --repo "${{ inputs.repository }}" --color ededed --force || true
+            done
             gh issue edit "${{ inputs.issue_number }}" --repo "${{ inputs.repository }}" --add-label "$labels" || true
           fi
           if [ -n "$comments" ]; then
